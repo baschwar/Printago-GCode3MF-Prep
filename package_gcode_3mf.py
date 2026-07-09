@@ -7,13 +7,16 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import zipfile
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageDraw
 
 
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CORE_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 
 
 CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
@@ -39,14 +42,12 @@ def read_zip(path: Path) -> dict[str, bytes]:
 
 
 def project_mesh_size(files: dict[str, bytes]) -> tuple[float, float, float]:
-    import xml.etree.ElementTree as ET
-
     model = files.get("3D/Objects/object_1.model")
     if model is None:
         return 42.0, 42.0, 21.0
 
     root = ET.fromstring(model)
-    ns = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
+    ns = {"m": CORE_NS}
     vertices = root.findall(".//m:vertex", ns)
     if not vertices:
         return 42.0, 42.0, 21.0
@@ -55,6 +56,67 @@ def project_mesh_size(files: dict[str, bytes]) -> tuple[float, float, float]:
     ys = [float(vertex.attrib["y"]) for vertex in vertices]
     zs = [float(vertex.attrib["z"]) for vertex in vertices]
     return max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
+
+
+def parse_build_transform(files: dict[str, bytes]) -> list[float] | None:
+    model = files.get("3D/3dmodel.model")
+    if model is None:
+        return None
+
+    root = ET.fromstring(model)
+    build_item = root.find(f".//{{{CORE_NS}}}build/{{{CORE_NS}}}item")
+    if build_item is None or "transform" not in build_item.attrib:
+        return None
+
+    values = [float(value) for value in build_item.attrib["transform"].split()]
+    if len(values) != 12:
+        return None
+    return values
+
+
+def transform_point(point: tuple[float, float, float], matrix: list[float] | None) -> tuple[float, float, float]:
+    if matrix is None:
+        return point
+    x, y, z = point
+    return (
+        matrix[0] * x + matrix[3] * y + matrix[6] * z + matrix[9],
+        matrix[1] * x + matrix[4] * y + matrix[7] * z + matrix[10],
+        matrix[2] * x + matrix[5] * y + matrix[8] * z + matrix[11],
+    )
+
+
+def project_mesh(files: dict[str, bytes]) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]] | None:
+    model = files.get("3D/Objects/object_1.model")
+    if model is None:
+        return None
+
+    root = ET.fromstring(model)
+    vertex_nodes = root.findall(f".//{{{CORE_NS}}}vertex")
+    triangle_nodes = root.findall(f".//{{{CORE_NS}}}triangle")
+    if not vertex_nodes or not triangle_nodes:
+        return None
+
+    matrix = parse_build_transform(files)
+    vertices = [
+        transform_point(
+            (
+                float(vertex.attrib["x"]),
+                float(vertex.attrib["y"]),
+                float(vertex.attrib["z"]),
+            ),
+            matrix,
+        )
+        for vertex in vertex_nodes
+    ]
+    triangles = [
+        (
+            int(triangle.attrib["v1"]),
+            int(triangle.attrib["v2"]),
+            int(triangle.attrib["v3"]),
+        )
+        for triangle in triangle_nodes
+    ]
+    return vertices, triangles
 
 
 def iso_point(x: float, y: float, z: float, scale: float, ox: float, oy: float) -> tuple[float, float]:
@@ -142,7 +204,115 @@ def render_bin_thumbnail(width_mm: float, depth_mm: float, height_mm: float, siz
     return output.getvalue()
 
 
-def render_thumbnails(files: dict[str, bytes]) -> dict[str, bytes]:
+def render_mesh_thumbnail(files: dict[str, bytes], size: int) -> bytes | None:
+    mesh = project_mesh(files)
+    if mesh is None:
+        return None
+    vertices, triangles = mesh
+
+    angle = math.radians(-35)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    def view(point: tuple[float, float, float]) -> tuple[float, float, float]:
+        x, y, z = point
+        xr = x * cos_a - y * sin_a
+        yr = x * sin_a + y * cos_a
+        return xr, yr - z * 0.82, z + yr * 0.08
+
+    viewed = [view(vertex) for vertex in vertices]
+    xs = [point[0] for point in viewed]
+    ys = [point[1] for point in viewed]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    width = max(max_x - min_x, 1.0)
+    height = max(max_y - min_y, 1.0)
+    margin = size * 0.12
+    scale = min((size - margin * 2) / width, (size - margin * 2) / height)
+
+    def screen(point: tuple[float, float, float]) -> tuple[float, float]:
+        x, y, _ = point
+        return (
+            margin + (x - min_x) * scale,
+            margin + (y - min_y) * scale,
+        )
+
+    faces = []
+    light = (0.25, -0.55, 0.8)
+    light_len = math.sqrt(sum(component * component for component in light))
+    light = tuple(component / light_len for component in light)
+    for a, b, c in triangles:
+        p1 = vertices[a]
+        p2 = vertices[b]
+        p3 = vertices[c]
+        u = (p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2])
+        v = (p3[0] - p1[0], p3[1] - p1[1], p3[2] - p1[2])
+        normal = (
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        )
+        normal_len = math.sqrt(sum(component * component for component in normal)) or 1.0
+        normal = tuple(component / normal_len for component in normal)
+        brightness = max(0.0, sum(normal[index] * light[index] for index in range(3)))
+        shade = int(105 + brightness * 105)
+        depth = (viewed[a][2] + viewed[b][2] + viewed[c][2]) / 3.0
+        faces.append(
+            (
+                depth,
+                [screen(viewed[a]), screen(viewed[b]), screen(viewed[c])],
+                (shade, shade, max(shade - 5, 0), 255),
+            )
+        )
+
+    image = Image.new("RGBA", (size, size), (243, 246, 250, 255))
+    draw = ImageDraw.Draw(image)
+    for _, points, fill in sorted(faces, key=lambda face: face[0]):
+        polygon(draw, points, fill)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def resize_thumbnail(data: bytes, size: int) -> bytes:
+    image = Image.open(io.BytesIO(data)).convert("RGBA")
+    image.thumbnail((size, size), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    x = (size - image.width) // 2
+    y = (size - image.height) // 2
+    canvas.alpha_composite(image, (x, y))
+    output = io.BytesIO()
+    canvas.save(output, format="PNG")
+    return output.getvalue()
+
+
+def render_thumbnails(files: dict[str, bytes], thumbnail: Path | None = None) -> dict[str, bytes]:
+    if thumbnail is not None:
+        data = thumbnail.read_bytes()
+        image_512 = resize_thumbnail(data, 512)
+        image_256 = resize_thumbnail(data, 256)
+        image_128 = resize_thumbnail(data, 128)
+        return {
+            "Metadata/plate_1.png": image_512,
+            "Metadata/plate_1_small.png": image_256,
+            "Metadata/plate_no_light_1.png": image_512,
+            "Metadata/top_1.png": image_256,
+            "Metadata/pick_1.png": image_128,
+        }
+
+    mesh_512 = render_mesh_thumbnail(files, 512)
+    mesh_256 = render_mesh_thumbnail(files, 256)
+    mesh_128 = render_mesh_thumbnail(files, 128)
+    if mesh_512 is not None and mesh_256 is not None and mesh_128 is not None:
+        return {
+            "Metadata/plate_1.png": mesh_512,
+            "Metadata/plate_1_small.png": mesh_256,
+            "Metadata/plate_no_light_1.png": mesh_512,
+            "Metadata/top_1.png": mesh_256,
+            "Metadata/pick_1.png": mesh_128,
+        }
+
     width, depth, height = project_mesh_size(files)
     return {
         "Metadata/plate_1.png": render_bin_thumbnail(width, depth, height, 512),
@@ -292,7 +462,14 @@ def update_project_settings(data: bytes, gcode_text: str, settings_path: Path | 
     return json.dumps(settings, indent=4, ensure_ascii=False).encode("utf-8")
 
 
-def package(project: Path, gcode: Path, result: Path, output: Path, settings: Path | None) -> None:
+def package(
+    project: Path,
+    gcode: Path,
+    result: Path,
+    output: Path,
+    settings: Path | None,
+    thumbnail: Path | None = None,
+) -> None:
     files = read_zip(project)
     gcode_bytes = gcode.read_bytes()
     gcode_text = gcode_bytes.decode("utf-8", errors="replace")
@@ -304,7 +481,7 @@ def package(project: Path, gcode: Path, result: Path, output: Path, settings: Pa
     files["Metadata/_rels/model_settings.config.rels"] = GCODE_RELS.encode("utf-8")
     files["Metadata/plate_1.json"] = plate_json(result_data, gcode_text)
     files["Metadata/slice_info.config"] = slice_info(result_data, gcode_text)
-    files.update(render_thumbnails(files))
+    files.update(render_thumbnails(files, thumbnail))
     if "Metadata/project_settings.config" in files:
         files["Metadata/project_settings.config"] = update_project_settings(
             files["Metadata/project_settings.config"],
@@ -325,8 +502,9 @@ def main() -> int:
     parser.add_argument("--result", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--settings", type=Path, help="Printer preset JSON to stamp into project metadata.")
+    parser.add_argument("--thumbnail", type=Path, help="PNG preview to embed as package thumbnails.")
     args = parser.parse_args()
-    package(args.project, args.gcode, args.result, args.output, args.settings)
+    package(args.project, args.gcode, args.result, args.output, args.settings, args.thumbnail)
     print(f"wrote {args.output}")
     return 0
 
